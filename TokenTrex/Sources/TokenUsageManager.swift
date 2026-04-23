@@ -1,0 +1,355 @@
+import Foundation
+import Combine
+
+// MARK: - Reset Time Format
+
+enum ResetTimeFormat: String, CaseIterable {
+    case relative
+    case absolute
+    case both
+}
+
+// MARK: - Token Usage Manager
+
+/// Tracks Claude API token usage within a 5-hour session window.
+/// Uses real API data from Claude Code's OAuth credentials when available,
+/// falls back to mock data otherwise.
+final class TokenUsageManager: ObservableObject {
+
+    // MARK: - Published State
+
+    @Published var animationEnabled: Bool = (UserDefaults.standard.object(forKey: "animationEnabled") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(animationEnabled, forKey: "animationEnabled") }
+    }
+
+    @Published var showPercentageInMenuBar: Bool = (UserDefaults.standard.object(forKey: "showPercentageInMenuBar") as? Bool) ?? false {
+        didSet { UserDefaults.standard.set(showPercentageInMenuBar, forKey: "showPercentageInMenuBar") }
+    }
+
+    @Published var resetTimeFormat: ResetTimeFormat = ResetTimeFormat(rawValue: UserDefaults.standard.string(forKey: "resetTimeFormat") ?? "relative") ?? .relative {
+        didSet { UserDefaults.standard.set(resetTimeFormat.rawValue, forKey: "resetTimeFormat") }
+    }
+
+    @Published private(set) var usagePercent: Double = 0
+    @Published private(set) var weeklyUsagePercent: Double = 0
+    @Published private(set) var extraUsageEnabled: Bool = false
+    @Published private(set) var extraUsagePercent: Double = 0
+    @Published private(set) var extraUsageUsed: Double = 0
+    @Published private(set) var extraUsageLimit: Int = 0
+    @Published private(set) var sessionResetDate: Date? = nil
+    @Published private(set) var weeklyResetDate: Date? = nil
+    @Published private(set) var isSessionActive: Bool = false
+    @Published private(set) var isUsingMockData: Bool = true
+    @Published private(set) var keychainAccessDenied: Bool = false
+    @Published private(set) var errorMessage: String? = nil
+    @Published private(set) var lastUpdated: Date? = nil
+    @Published private(set) var accountEmail: String? = nil
+    @Published private(set) var subscriptionType: String? = nil
+
+    // Mock-only state
+    @Published private(set) var tokensUsed: Int = 0
+    @Published private(set) var tokenLimit: Int = 300_000
+
+    /// Usage as 0.0–1.0 for the progress bar
+    var usageRatio: Double {
+        min(usagePercent / 100.0, 1.0)
+    }
+
+    /// Current animation state based on usage
+    var trexState: TrexState {
+        guard isSessionActive else { return .idle }
+        let pct = Int(usagePercent)
+        switch pct {
+        case 0..<40:    return .jumping
+        case 40..<80:   return .walking
+        case 80..<100:  return .tired
+        default:        return .sleeping
+        }
+    }
+
+    /// Time remaining in current session
+    var timeRemaining: TimeInterval? {
+        guard let reset = sessionResetDate else { return nil }
+        let remaining = reset.timeIntervalSinceNow
+        return max(remaining, 0)
+    }
+
+    /// Formatted time remaining string (e.g. "2h 50m" or "2d 7h")
+    var timeRemainingFormatted: String {
+        guard let remaining = timeRemaining else { return "no active session" }
+        return Self.relativeString(from: remaining)
+    }
+
+    /// Formatted reset display text for session, respecting the format setting
+    var sessionResetDisplayText: String? {
+        guard timeRemaining != nil else { return nil }
+        return resetDisplayText(for: sessionResetDate, relative: timeRemainingFormatted)
+    }
+
+    /// Formatted reset display text for weekly, respecting the format setting
+    var weeklyResetDisplayText: String? {
+        guard let date = weeklyResetDate else { return nil }
+        let remaining = max(date.timeIntervalSinceNow, 0)
+        return resetDisplayText(for: date, relative: Self.relativeString(from: remaining))
+    }
+
+    private func resetDisplayText(for date: Date?, relative: String) -> String? {
+        guard let date else { return "Resets in \(relative)" }
+        switch resetTimeFormat {
+        case .relative:
+            return "Resets in \(relative)"
+        case .absolute:
+            return "Resets \(Self.absoluteDateFormatter.string(from: date))"
+        case .both:
+            return "Resets in \(relative) (\(Self.absoluteDateFormatter.string(from: date)))"
+        }
+    }
+
+    private static let absoluteDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEE h:mm a"
+        return f
+    }()
+
+    private static func relativeString(from interval: TimeInterval) -> String {
+        if interval <= 0 { return "now" }
+        let days = Int(interval) / 86400
+        let hours = (Int(interval) % 86400) / 3600
+        let minutes = (Int(interval) % 3600) / 60
+        if days > 0 {
+            return "\(days)d \(hours)h"
+        }
+        return "\(hours)h \(minutes)m"
+    }
+
+    // MARK: - Configuration
+
+    private let pollInterval: TimeInterval = 2 * 60  // 2 minutes
+    private var accessToken: String?
+
+    private static let iso8601Formatter = ISO8601DateFormatter()
+    private static let flexibleISO8601Formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZZZZZ"
+        return formatter
+    }()
+
+    // MARK: - Timers
+
+    private var pollTimer: Timer?
+    private var fetchTask: Task<Void, Never>?
+
+    // MARK: - Init
+
+    init() {
+        switch ClaudeCodeCredentials.loadAccessToken() {
+        case .success(let token):
+            isUsingMockData = false
+            accessToken = token
+            fetchProfile(accessToken: token)
+            startPolling(accessToken: token)
+        case .accessDenied:
+            isUsingMockData = true
+            keychainAccessDenied = true
+            startMockSession()
+        case .notFound:
+            isUsingMockData = true
+            startMockSession()
+        }
+    }
+
+    deinit {
+        pollTimer?.invalidate()
+        fetchTask?.cancel()
+    }
+
+    // MARK: - Profile
+
+    private func fetchProfile(accessToken: String) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let profile = try? await UsageAPIClient.fetchProfile(accessToken: accessToken) {
+                self.accountEmail = profile.account.email
+                self.subscriptionType = Self.formatSubscriptionType(profile.organization?.organization_type)
+            }
+        }
+    }
+
+    // MARK: - Real API Polling
+
+    private func startPolling(accessToken: String) {
+        // Fetch immediately
+        fetchUsage(accessToken: accessToken)
+
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            self?.fetchUsage(accessToken: accessToken)
+        }
+    }
+
+    private func fetchUsage(accessToken: String) {
+        fetchTask?.cancel()
+        fetchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let response = try await UsageAPIClient.fetchUsage(accessToken: accessToken)
+                self.errorMessage = nil
+
+                if let fiveHour = response.five_hour {
+                    self.usagePercent = fiveHour.utilization
+                    self.isSessionActive = fiveHour.utilization > 0
+
+                    if let resetStr = fiveHour.resets_at {
+                        self.sessionResetDate = Self.iso8601Formatter.date(from: resetStr)
+                            ?? Self.flexibleISO8601Formatter.date(from: resetStr)
+                    } else {
+                        self.sessionResetDate = nil
+                    }
+                } else {
+                    self.usagePercent = 0
+                    self.isSessionActive = false
+                    self.sessionResetDate = nil
+                }
+
+                if let sevenDay = response.seven_day {
+                    self.weeklyUsagePercent = sevenDay.utilization
+
+                    if let resetStr = sevenDay.resets_at {
+                        self.weeklyResetDate = Self.iso8601Formatter.date(from: resetStr)
+                            ?? Self.flexibleISO8601Formatter.date(from: resetStr)
+                    } else {
+                        self.weeklyResetDate = nil
+                    }
+                } else {
+                    self.weeklyUsagePercent = 0
+                    self.weeklyResetDate = nil
+                }
+
+                if let extra = response.extra_usage {
+                    self.extraUsageEnabled = extra.is_enabled
+                    self.extraUsagePercent = extra.utilization ?? 0
+                    self.extraUsageUsed = extra.used_credits ?? 0
+                    self.extraUsageLimit = extra.monthly_limit ?? 0
+                } else {
+                    self.extraUsageEnabled = false
+                    self.extraUsagePercent = 0
+                    self.extraUsageUsed = 0
+                    self.extraUsageLimit = 0
+                }
+
+                self.lastUpdated = Date()
+            } catch UsageAPIError.unauthorized {
+                // First, check if Claude Code already refreshed the token
+                if case .success(let freshToken) = ClaudeCodeCredentials.loadAccessToken(), freshToken != accessToken {
+                    self.accessToken = freshToken
+                    self.fetchProfile(accessToken: freshToken)
+                    self.startPolling(accessToken: freshToken)
+                    return
+                }
+                // Otherwise, attempt our own OAuth token refresh
+                if let refreshToken = ClaudeCodeCredentials.loadRefreshToken() {
+                    do {
+                        let tokenResponse = try await UsageAPIClient.refreshAccessToken(refreshToken: refreshToken)
+                        let expiresAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(Double(tokenResponse.expires_in)))
+                        let saved = ClaudeCodeCredentials.saveTokens(
+                            accessToken: tokenResponse.access_token,
+                            refreshToken: tokenResponse.refresh_token,
+                            expiresAt: expiresAt
+                        )
+                        if saved {
+                            self.accessToken = tokenResponse.access_token
+                            self.errorMessage = nil
+                            self.fetchProfile(accessToken: tokenResponse.access_token)
+                            self.startPolling(accessToken: tokenResponse.access_token)
+                            return
+                        }
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        // Refresh failed — fall through to show error
+                    }
+                }
+                self.errorMessage = UsageAPIError.unauthorized.errorDescription
+            } catch UsageAPIError.rateLimited {
+                // Keep last known data, retry at next poll cycle
+                return
+            } catch let error as UsageAPIError {
+                self.errorMessage = error.errorDescription
+            } catch is CancellationError {
+                // Task was cancelled by a newer fetch — ignore silently
+                return
+            } catch {
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - Mock Data
+
+    func startMockSession() {
+        isUsingMockData = true
+        isSessionActive = false
+        tokensUsed = 0
+        tokenLimit = 300_000
+        usagePercent = 0
+        sessionResetDate = nil
+    }
+
+    func cycleMockUsage() {
+        guard isUsingMockData else { return }
+
+        let levels: [Double] = [00, 20, 60, 90, 100]
+        let currentIndex = levels.firstIndex(where: { $0 >= usagePercent }) ?? 0
+        let nextIndex = (currentIndex + 1) % levels.count
+        let nextPercent = levels[nextIndex]
+
+        if nextPercent == 0 {
+            isSessionActive = false
+            usagePercent = 0
+            tokensUsed = 0
+            sessionResetDate = nil
+        } else {
+            isSessionActive = true
+            usagePercent = nextPercent
+            tokensUsed = Int(Double(tokenLimit) * nextPercent / 100.0)
+            if sessionResetDate == nil {
+                sessionResetDate = Date().addingTimeInterval(3 * 60 * 60)
+            }
+        }
+    }
+
+    // MARK: - Manual Refresh
+
+    func refresh() {
+        guard let token = accessToken else { return }
+        fetchUsage(accessToken: token)
+    }
+
+    private static func formatSubscriptionType(_ type: String?) -> String? {
+        switch type {
+        case "claude_free": return "Free"
+        case "claude_pro": return "Pro"
+        case "claude_max": return "Max"
+        case "claude_team": return "Team"
+        case "claude_enterprise": return "Enterprise"
+        default: return nil
+        }
+    }
+
+    // MARK: - Session Management
+
+    func resetSession() {
+        usagePercent = 0
+        weeklyUsagePercent = 0
+        extraUsageEnabled = false
+        extraUsagePercent = 0
+        extraUsageUsed = 0
+        extraUsageLimit = 0
+        tokensUsed = 0
+        sessionResetDate = nil
+        weeklyResetDate = nil
+        isSessionActive = false
+        pollTimer?.invalidate()
+    }
+}
